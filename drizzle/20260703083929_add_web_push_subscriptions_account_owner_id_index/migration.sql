@@ -1,0 +1,1 @@
+CREATE INDEX "web_push_subscriptions_account_owner_id_index" ON "web_push_subscriptions" ("account_owner_id");
