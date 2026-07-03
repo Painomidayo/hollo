@@ -14,16 +14,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: jdx/mise-action@v4
         with:
-          version: 9.15.1+sha512.1acb565e6193efbebda772702950469150cf12bcc764262e7587e71d19dc98a423dff9536e57ea44c49bdf790ff694e83c27be5faa23d67e0c033b583be4bfcf
-          run_install: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 23
-          cache: pnpm
-      - run: pnpm install
-      - run: pnpm run check:ci
+          install: true
+          experimental: true
+      - run: mise run check:ci
       - if: github.ref_type == 'tag'
         run: |
           set -ex
@@ -142,10 +137,10 @@ jobs:
           run_install: false
       - uses: actions/setup-node@v4
         with:
-          node-version: 23
+          node-version: 24
           cache: pnpm
       - run: |
-          pnpm install
+          pnpm install --frozen-lockfile
           pnpm exec astro check
           pnpm exec astro build --site "$DOCS_SITE"
         env:
