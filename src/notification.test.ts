@@ -1,7 +1,14 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import type { MockInstance } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import webpush from "web-push";
 
 import { cleanDatabase } from "../tests/helpers";
-import { createAccount } from "../tests/helpers/oauth";
+import {
+  createAccount,
+  createOAuthApplication,
+  findAccessToken,
+  getAccessToken,
+} from "../tests/helpers/oauth";
 import { createExpiredPollPost } from "../tests/helpers/poll";
 import db from "./db";
 import {
@@ -11,6 +18,7 @@ import {
   createQuotedUpdateNotifications,
   createQuoteNotification,
   createReplyMentionNotification,
+  sendPushNotifications,
 } from "./notification";
 import * as Schema from "./schema";
 import type { Uuid } from "./uuid";
@@ -552,5 +560,197 @@ describe("Quote notifications", () => {
       expect(notifications.length).toBe(1);
       expect(notifications[0].id).toBe(notificationId1);
     });
+  });
+});
+
+describe("sendPushNotifications", () => {
+  let localAccount: Awaited<ReturnType<typeof createAccount>>;
+  let remoteAccount: Schema.Account;
+  let sendNotificationMock: MockInstance<typeof webpush.sendNotification>;
+
+  beforeEach(async () => {
+    await cleanDatabase();
+    localAccount = await createAccount();
+    remoteAccount = await createRemoteAccount("remote_user");
+    sendNotificationMock = vi
+      .spyOn(webpush, "sendNotification")
+      .mockResolvedValue({ statusCode: 201, body: "", headers: {} });
+  });
+
+  afterEach(() => {
+    sendNotificationMock.mockRestore();
+  });
+
+  async function createSubscription(
+    overrides: Partial<Schema.NewWebPushSubscription> = {},
+  ): Promise<Uuid> {
+    const application = await createOAuthApplication();
+    const token = await getAccessToken(
+      application,
+      { id: localAccount.id as Uuid },
+      ["push"],
+    );
+    const accessToken = await findAccessToken(token.token);
+    const subscriptionId = crypto.randomUUID() as Uuid;
+
+    await db.insert(Schema.webPushSubscriptions).values({
+      id: subscriptionId,
+      accessTokenCode: accessToken!.code,
+      accountOwnerId: localAccount.id as Uuid,
+      endpoint: "https://push.example/endpoint",
+      p256dhKey: "p256dh-key",
+      authKey: "auth-key",
+      mentionAlerts: true,
+      policy: "all",
+      ...overrides,
+    });
+
+    return subscriptionId;
+  }
+
+  it("removes the subscription when the push service reports it gone", async () => {
+    expect.assertions(1);
+
+    const subscriptionId = await createSubscription();
+    sendNotificationMock.mockRejectedValueOnce(
+      new webpush.WebPushError("Gone", 410, {}, "", ""),
+    );
+
+    await sendPushNotifications(
+      {
+        accountOwnerId: localAccount.id as Uuid,
+        type: "mention",
+        actorAccountId: remoteAccount.id,
+      },
+      crypto.randomUUID() as Uuid,
+    );
+
+    const remaining = await db.query.webPushSubscriptions.findFirst({
+      where: { id: { eq: subscriptionId } },
+    });
+    expect(remaining).toBeUndefined();
+  });
+
+  it("keeps the subscription when delivery fails for another reason", async () => {
+    expect.assertions(1);
+
+    const subscriptionId = await createSubscription();
+    sendNotificationMock.mockRejectedValueOnce(new Error("network error"));
+
+    await sendPushNotifications(
+      {
+        accountOwnerId: localAccount.id as Uuid,
+        type: "mention",
+        actorAccountId: remoteAccount.id,
+      },
+      crypto.randomUUID() as Uuid,
+    );
+
+    const remaining = await db.query.webPushSubscriptions.findFirst({
+      where: { id: { eq: subscriptionId } },
+    });
+    expect(remaining).not.toBeUndefined();
+  });
+
+  it("does not deliver when the alert type is disabled", async () => {
+    expect.assertions(1);
+
+    await createSubscription({ mentionAlerts: false });
+
+    await sendPushNotifications(
+      {
+        accountOwnerId: localAccount.id as Uuid,
+        type: "mention",
+        actorAccountId: remoteAccount.id,
+      },
+      crypto.randomUUID() as Uuid,
+    );
+
+    expect(sendNotificationMock).not.toHaveBeenCalled();
+  });
+
+  it("does not deliver when the subscription's policy is 'none'", async () => {
+    expect.assertions(1);
+
+    await createSubscription({ policy: "none" });
+
+    await sendPushNotifications(
+      {
+        accountOwnerId: localAccount.id as Uuid,
+        type: "mention",
+        actorAccountId: remoteAccount.id,
+      },
+      crypto.randomUUID() as Uuid,
+    );
+
+    expect(sendNotificationMock).not.toHaveBeenCalled();
+  });
+
+  it("delivers under a 'followed' policy only when the owner follows the actor", async () => {
+    expect.assertions(2);
+
+    await createSubscription({ policy: "followed" });
+
+    await sendPushNotifications(
+      {
+        accountOwnerId: localAccount.id as Uuid,
+        type: "mention",
+        actorAccountId: remoteAccount.id,
+      },
+      crypto.randomUUID() as Uuid,
+    );
+    expect(sendNotificationMock).not.toHaveBeenCalled();
+
+    await db.insert(Schema.follows).values({
+      iri: `https://hollo.test/follows/${crypto.randomUUID()}`,
+      followingId: remoteAccount.id,
+      followerId: localAccount.id as Uuid,
+      approved: new Date(),
+    });
+
+    await sendPushNotifications(
+      {
+        accountOwnerId: localAccount.id as Uuid,
+        type: "mention",
+        actorAccountId: remoteAccount.id,
+      },
+      crypto.randomUUID() as Uuid,
+    );
+    expect(sendNotificationMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("includes the subscription's access token in the push payload", async () => {
+    expect.assertions(2);
+
+    const application = await createOAuthApplication();
+    const token = await getAccessToken(
+      application,
+      { id: localAccount.id as Uuid },
+      ["push"],
+    );
+    const accessToken = await findAccessToken(token.token);
+    await db.insert(Schema.webPushSubscriptions).values({
+      id: crypto.randomUUID() as Uuid,
+      accessTokenCode: accessToken!.code,
+      accountOwnerId: localAccount.id as Uuid,
+      endpoint: "https://push.example/endpoint",
+      p256dhKey: "p256dh-key",
+      authKey: "auth-key",
+      mentionAlerts: true,
+      policy: "all",
+    });
+
+    await sendPushNotifications(
+      {
+        accountOwnerId: localAccount.id as Uuid,
+        type: "mention",
+        actorAccountId: remoteAccount.id,
+      },
+      crypto.randomUUID() as Uuid,
+    );
+
+    expect(sendNotificationMock).toHaveBeenCalledTimes(1);
+    const [, payload] = sendNotificationMock.mock.calls[0];
+    expect(JSON.parse(payload as string).access_token).toBe(accessToken!.code);
   });
 });

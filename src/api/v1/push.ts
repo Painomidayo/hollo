@@ -47,7 +47,7 @@ function serializeSubscription(
   return {
     id: sub.id,
     endpoint: sub.endpoint,
-    standard: "legacy",
+    standard: false,
     alerts: {
       follow: sub.followAlerts,
       favourite: sub.favouriteAlerts,

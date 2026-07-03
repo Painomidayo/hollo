@@ -11,6 +11,7 @@ import {
   notifications,
   pollVotes,
   posts,
+  webPushSubscriptions,
   type WebPushSubscription,
 } from "./schema";
 import type { Uuid } from "./uuid";
@@ -75,7 +76,7 @@ export async function createNotification(
   const created = context.created ?? new Date();
   const notificationId = uuidv7(Math.max(0, +created));
 
-  const createdId = await db.transaction(async (tx) => {
+  const { id: createdId, isNew } = await db.transaction(async (tx) => {
     // Check for existing duplicate notification to prevent duplicates from
     // federation activities that may be processed multiple times
     const existingNotification = await tx.query.notifications.findFirst({
@@ -114,7 +115,7 @@ export async function createNotification(
           type: context.type,
         },
       );
-      return existingNotification.id;
+      return { id: existingNotification.id, isNew: false };
     }
 
     // Insert the notification
@@ -163,7 +164,9 @@ export async function createNotification(
                 )!,
         },
       });
-      if (conflictedNotification != null) return conflictedNotification.id;
+      if (conflictedNotification != null) {
+        return { id: conflictedNotification.id, isNew: false };
+      }
       throw new Error(`Failed to create ${context.type} notification`);
     }
 
@@ -223,12 +226,14 @@ export async function createNotification(
       },
     );
 
-    return notificationId;
+    return { id: notificationId, isNew: true };
   });
 
-  sendPushNotifications(context, createdId).catch((err) => {
-    logger.error("Failed to send push notifications: {err}", { err });
-  });
+  if (isNew) {
+    sendPushNotifications(context, createdId).catch((err) => {
+      logger.error("Failed to send push notifications: {err}", { err });
+    });
+  }
 
   return createdId;
 }
@@ -751,10 +756,11 @@ function alertEnabledForType(
     case "poll":
       return sub.pollAlerts;
     case "status":
-    case "update":
-    case "quoted_update":
     case "quote":
       return sub.statusAlerts;
+    case "update":
+    case "quoted_update":
+      return sub.updateAlerts;
     case "follow_request":
       return sub.followRequestAlerts;
     default:
@@ -762,7 +768,58 @@ function alertEnabledForType(
   }
 }
 
-async function sendPushNotifications(
+const NOTIFICATION_TITLES: Record<NotificationType, string> = {
+  follow: "New follower",
+  follow_request: "New follow request",
+  favourite: "New favourite",
+  emoji_reaction: "New reaction",
+  reblog: "New boost",
+  mention: "New mention",
+  poll: "Poll ended",
+  status: "New post",
+  update: "Post edited",
+  quote: "New quote",
+  quoted_update: "Quoted post edited",
+  "admin.sign_up": "New sign-up",
+  "admin.report": "New report",
+};
+
+async function isFollowing(
+  followerId: Uuid,
+  followingId: Uuid,
+): Promise<boolean> {
+  const row = await db.query.follows.findFirst({
+    where: {
+      followerId: { eq: followerId },
+      followingId: { eq: followingId },
+      approved: { isNotNull: true as const },
+    },
+  });
+  return row != null;
+}
+
+/**
+ * Determines whether a subscription's push policy allows notifying for the
+ * given notification context, mirroring Mastodon's `all`/`followed`/
+ * `follower`/`none` push policy semantics.
+ */
+async function policyAllows(
+  policy: string,
+  accountOwnerId: Uuid,
+  actorAccountId: Uuid | undefined,
+): Promise<boolean> {
+  if (policy === "none") return false;
+  if (policy === "all" || actorAccountId == null) return true;
+  if (policy === "followed") {
+    return await isFollowing(accountOwnerId, actorAccountId);
+  }
+  if (policy === "follower") {
+    return await isFollowing(actorAccountId, accountOwnerId);
+  }
+  return true;
+}
+
+export async function sendPushNotifications(
   context: NotificationContext,
   notificationId: Uuid,
 ): Promise<void> {
@@ -780,38 +837,69 @@ async function sendPushNotifications(
     return;
   }
 
-  const payload = JSON.stringify({
-    notification_id: notificationId,
-    notification_type: context.type,
-    preferred_locale: "en",
-    icon: "",
-    title: context.type,
-    body: "",
-  });
-
-  for (const sub of subs) {
-    if (!alertEnabledForType(sub, context.type)) continue;
-
-    try {
-      await webpush.sendNotification(
-        {
-          endpoint: sub.endpoint,
-          keys: { p256dh: sub.p256dhKey, auth: sub.authKey },
-        },
-        payload,
-        {
-          vapidDetails: {
-            subject: vapid.subject,
-            publicKey: vapid.publicKey,
-            privateKey: vapid.privateKey,
-          },
-        },
+  const policyCache = new Map<string, Promise<boolean>>();
+  const allowedByPolicy = (policy: string): Promise<boolean> => {
+    let result = policyCache.get(policy);
+    if (result == null) {
+      result = policyAllows(
+        policy,
+        context.accountOwnerId,
+        context.actorAccountId,
       );
-    } catch (err) {
-      logger.warn(
-        "Push notification delivery failed for subscription {id}: {err}",
-        { id: sub.id, err },
-      );
+      policyCache.set(policy, result);
     }
-  }
+    return result;
+  };
+
+  await Promise.allSettled(
+    subs.map(async (sub) => {
+      if (!alertEnabledForType(sub, context.type)) return;
+      if (!(await allowedByPolicy(sub.policy))) return;
+
+      const payload = JSON.stringify({
+        access_token: sub.accessTokenCode,
+        notification_id: notificationId,
+        notification_type: context.type,
+        preferred_locale: "en",
+        icon: "",
+        title: NOTIFICATION_TITLES[context.type] ?? context.type,
+        body: "",
+      });
+
+      try {
+        await webpush.sendNotification(
+          {
+            endpoint: sub.endpoint,
+            keys: { p256dh: sub.p256dhKey, auth: sub.authKey },
+          },
+          payload,
+          {
+            vapidDetails: {
+              subject: vapid.subject,
+              publicKey: vapid.publicKey,
+              privateKey: vapid.privateKey,
+            },
+          },
+        );
+      } catch (err) {
+        if (
+          err instanceof webpush.WebPushError &&
+          (err.statusCode === 404 || err.statusCode === 410)
+        ) {
+          logger.info("Removing stale push subscription {id} ({statusCode})", {
+            id: sub.id,
+            statusCode: err.statusCode,
+          });
+          await db
+            .delete(webPushSubscriptions)
+            .where(eq(webPushSubscriptions.id, sub.id));
+          return;
+        }
+        logger.warn(
+          "Push notification delivery failed for subscription {id}: {err}",
+          { id: sub.id, err },
+        );
+      }
+    }),
+  );
 }
