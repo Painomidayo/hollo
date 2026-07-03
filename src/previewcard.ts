@@ -1,3 +1,5 @@
+import { isSSRFSafeURL } from "ssrfcheck";
+
 export interface PreviewCard {
   url: string;
   title: string;
@@ -13,10 +15,21 @@ export interface PreviewCard {
 export async function fetchPreviewCard(
   url: string | URL,
 ): Promise<PreviewCard | null> {
+  const href = url.toString();
+  let parsed: URL;
+  try {
+    parsed = new URL(href);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return null;
+  }
+  if (!isSSRFSafeURL(href)) return null;
   const { default: ogs } = await import("open-graph-scraper");
   let response: Awaited<ReturnType<typeof ogs>>;
   try {
-    response = await ogs({ url: url.toString() });
+    response = await ogs({ url: href });
   } catch (_) {
     return null;
   }

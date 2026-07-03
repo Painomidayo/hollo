@@ -1,3 +1,5 @@
+import { escape } from "es-toolkit";
+
 import { renderCustomEmojis } from "../custom-emoji";
 import { stripQuoteInlineFallbacks } from "../html";
 import { proxyUrl } from "../media-proxy";
@@ -12,6 +14,7 @@ import type {
   QuoteState,
   Reaction,
 } from "../schema";
+import { sanitizeHtml } from "../xss";
 
 export type PostAccount = Account & { owner?: AccountOwner | null };
 
@@ -85,7 +88,7 @@ export function Post({
     );
   const account = post.account;
   const authorNameHtml = renderCustomEmojis(
-    account.name,
+    escape(account.name),
     account.emojis,
     baseUrl,
   );
@@ -365,7 +368,7 @@ function PostContent({ post, featured, baseUrl }: PostContentProps) {
     ? stripQuoteInlineFallbacks(post.contentHtml)
     : post.contentHtml;
   const contentHtml = renderCustomEmojis(
-    displayContentHtml,
+    sanitizeHtml(displayContentHtml ?? ""),
     post.emojis,
     baseUrl,
   );

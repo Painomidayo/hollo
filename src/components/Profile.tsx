@@ -3,6 +3,7 @@ import { escape } from "es-toolkit";
 import { renderCustomEmojis } from "../custom-emoji";
 import { proxyUrl } from "../media-proxy";
 import type { Account, AccountOwner } from "../schema";
+import { sanitizeHtml } from "../xss";
 
 export interface ProfileProps {
   accountOwner: AccountOwner & { account: Account };
@@ -19,7 +20,7 @@ export function Profile({ accountOwner, baseUrl }: ProfileProps) {
     baseUrl,
   );
   const bioHtml = renderCustomEmojis(
-    account.bioHtml ?? "",
+    sanitizeHtml(account.bioHtml ?? ""),
     account.emojis,
     baseUrl,
   );
@@ -115,7 +116,7 @@ export function Profile({ accountOwner, baseUrl }: ProfileProps) {
                   </dt>
                   <dd
                     class="mt-1 text-sm text-neutral-800 dark:text-neutral-200 [&_a]:text-brand-700 [&_a]:underline-offset-2 hover:[&_a]:underline dark:[&_a]:text-brand-400"
-                    dangerouslySetInnerHTML={{ __html: value }}
+                    dangerouslySetInnerHTML={{ __html: sanitizeHtml(value) }}
                   />
                 </div>
               ))}
